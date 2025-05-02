@@ -8,6 +8,7 @@
 
 #define SERV_PORT 9877      // Match with server
 #define MAXLINE 4096        // For buffers
+#define TBD 17
 
 // Define SA as Stevens does (optional)
 #define SA struct sockaddr
@@ -41,8 +42,11 @@ int main(int argc, char **argv)
     int sockfd;
     struct sockaddr_in servaddr;
 
-    if(argc != 2)
+    if(argc != 2){
         perror("usage: udpcli <IPaddress>");
+        exit(TBD);
+    }
+        
 
     bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
@@ -60,5 +64,6 @@ int main(int argc, char **argv)
 
     dg_cli(stdin, sockfd, (SA *) &servaddr, sizeof(servaddr));
 
+    close(sockfd);
     exit(0);
 }

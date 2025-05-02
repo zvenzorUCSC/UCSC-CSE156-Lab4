@@ -10,6 +10,7 @@
 #define SERV_PORT 9877      // Default UDP server port
 #define MAXLINE 4096        // Max buffer size
 #define SA struct sockaddr  // This is what the textbook does
+#define TBD 16
 
 void dg_echo(int sockfd, SA *pcliaddr, socklen_t clilen)
 {
@@ -25,9 +26,14 @@ void dg_echo(int sockfd, SA *pcliaddr, socklen_t clilen)
             continue;
         }
 
-        if (sendto(sockfd, mesg, n, 0, pcliaddr, len) != n)
-            perror("dg_echo sendto error");
+        mesg[n] = '\0';
+        printf("Received: %s", mesg);  // TODO: Remove, just debugging
 
+        if (sendto(sockfd, mesg, n, 0, pcliaddr, len) != n){
+            perror("dg_echo sendto error");
+            exit(TBD);
+        }
+            
     }
 }
 
@@ -37,8 +43,10 @@ int main(int argc, char **argv) {
     struct sockaddr_in servaddr, cliaddr;
 
     // create the socket
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0){
         perror("socket error");
+        exit(TBD);
+    }
 
     // zero out the server address
     bzero(&servaddr, sizeof(servaddr));
@@ -47,8 +55,11 @@ int main(int argc, char **argv) {
     servaddr.sin_port = htons(SERV_PORT);
 
     // bind the socket to the address
-    if (bind(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0)
+    if (bind(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0){
         perror("bind error");
+        exit(TBD);
+    }
+        
     
     // Echo server loop from unp.h in the textbook
     dg_echo(sockfd, (SA *) &cliaddr, sizeof(cliaddr));
