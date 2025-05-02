@@ -1,59 +1,64 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>         // for memset
-#include <unistd.h>         // for close()
-#include <arpa/inet.h>      // for htons(), htonl(), inet_pton()
-#include <sys/types.h>
-#include <sys/socket.h>
+#include <unistd.h>         // for close(), read(), write()
+#include <arpa/inet.h>      // for inet_pton()
+#include <sys/socket.h>     // for socket()
 #include <netinet/in.h>     // for sockaddr_in
 
-#define SERV_PORT 9877      // Default UDP server port
-#define MAXLINE 4096        // Max buffer size
-#define SA struct sockaddr  // This is what the textbook does
+#define SERV_PORT 9877      // Match with server
+#define MAXLINE 4096        // For buffers
 
-void dg_echo(int sockfd, SA *pcliaddr, socklen_t clilen)
+// Define SA as Stevens does (optional)
+#define SA struct sockaddr
+
+void dg_cli(FILE *fp, int sockfd, const SA *pservaddr, socklen_t servlen)
 {
     int n;
-    socklen_t len;
-    char mesg[MAXLINE];
+    char sendline[MAXLINE], recvline[MAXLINE + 1];
 
-    for ( ; ; ) {
-        len = clilen;
-
-        if ((n = recvfrom(sockfd, mesg, sizeof(mesg), 0, pcliaddr, &len)) < 0){
-            perror("dg_echo recvfrom error");
+    while (fgets(sendline, MAXLINE, fp) != NULL) {
+        if (sendto(sockfd, sendline, strlen(sendline), 0, pservaddr, servlen) < 0) {
+            perror("sendto error");
             continue;
         }
 
-        if (sendto(sockfd, mesg, n, 0, pcliaddr, len) != n)
-            perror("dg_echo sendto error");
+        if ((n = recvfrom(sockfd, recvline, MAXLINE, 0, NULL, NULL)) < 0) {
+            perror("recvfrom error");
+            continue;
+        }
 
+        recvline[n] = 0; // null terminate
+        if (fputs(recvline, stdout) == EOF) {
+            perror("fputs error");
+            break;
+        }
     }
 }
-
 
 int main(int argc, char **argv)
 {
     int sockfd;
-    struct sockaddr_in servaddr, cliaddr;
+    struct sockaddr_in servaddr;
 
-    // create the socket
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-        perror("socket error");
+    if(argc != 2)
+        perror("usage: udpcli <IPaddress>");
 
-    // zero out the server address
     bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(SERV_PORT);
 
-    // bind the socket to the address
-    if (bind(sockfd, (struct sockaddr *) &servaddr, sizeof(servaddr)) < 0)
-        perror("bind error");
-    
-    // Echo server loop from unp.h in the textbook
-    dg_echo(sockfd, (SA *) &cliaddr, sizeof(cliaddr));
+    if (inet_pton(AF_INET, argv[1], &servaddr.sin_addr) <= 0) {
+        perror("inet_pton error");
+        exit(EXIT_FAILURE);
+    }
 
-    close(sockfd);
-    return 0;
+    if (sockfd = socket(AF_INET, SOCK_DGRAM, 0) < 0) {
+        perror("socket error");
+        exit(EXIT_FAILURE); //defined in stdlib as 1
+    }
+
+    dg_cli(stdin, sockfd, (SA *) &servaddr, sizeof(servaddr));
+
+    exit(0);
 }
