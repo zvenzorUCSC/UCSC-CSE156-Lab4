@@ -26,8 +26,8 @@ void dg_echo(int sockfd, SA *pcliaddr, socklen_t clilen)
             continue;
         }
 
-        mesg[n] = '\0';
-        printf("Received: %s", mesg);  // TODO: Remove, just debugging
+        // mesg[n] = '\0';
+        // printf("Received: %s", mesg);  // TODO: Remove, just debugging
 
         if (sendto(sockfd, mesg, n, 0, pcliaddr, len) != n){
             perror("dg_echo sendto error");

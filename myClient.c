@@ -8,6 +8,11 @@
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <errno.h>
+#include <libgen.h>     // dirname()
+#include <sys/stat.h>   // mkdir()
+#include <sys/types.h>
+#include <errno.h>
+
 
 #define MAXLINE 4096
 #define TBD 17
@@ -169,6 +174,32 @@ void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packet
     free(received);
 }
 
+int create_parent_dirs(const char *filepath) {
+    char path_copy[4096];
+    strncpy(path_copy, filepath, sizeof(path_copy));
+    path_copy[sizeof(path_copy) - 1] = '\0';
+
+    char *dir = dirname(path_copy);
+    if (!dir || strcmp(dir, ".") == 0) return 0;  // No directories to make
+
+    char temp[4096] = {0};
+    char *token;
+    char *rest = dir;
+
+    while ((token = strtok_r(rest, "/", &rest))) {
+        strcat(temp, "/");
+        strcat(temp, token);
+
+        if (access(temp, F_OK) != 0) {
+            if (mkdir(temp, 0755) != 0 && errno != EEXIST) {
+                perror("mkdir failed");
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int sockfd;
     struct sockaddr_in servaddr;
@@ -188,6 +219,12 @@ int main(int argc, char **argv) {
     if (!in_file) {
         perror("input file open error");
         exit(TBD);
+    }
+
+    if (create_parent_dirs(out_path) < 0) {
+        fprintf(stderr, "Failed to create directories for output path\n");
+        fclose(in_file);
+        exit(11);  // Non-standard error code for path creation failure
     }
 
     FILE *out_file = fopen(out_path, "wb+");
