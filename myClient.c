@@ -6,6 +6,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/time.h>  // NEW: for timeout
+#include <errno.h>     // NEW: for errno
 
 #define MAXLINE 4096
 #define TBD 17
@@ -19,7 +21,6 @@ struct packet_header {
     char cruzid[CRUZID_LEN];
 };
 
-// Step 1–2: Send file with headers
 int dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int mss)
 {
     if (mss <= sizeof(struct packet_header)) {
@@ -54,14 +55,13 @@ int dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int
         }
 
         seq++;
-        usleep(500000);
+        usleep(500000); // 0.5 sec delay to reduce UDP loss
     }
 
     free(buf);
-    return seq; // return how many packets were sent
+    return seq;
 }
 
-// Step 3: Receive echoed packets and write to output file
 void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packets)
 {
     char *recv_buf = malloc(mss);
@@ -85,9 +85,14 @@ void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packet
 
     while (received_count < expected_packets) {
         ssize_t n = recvfrom(sockfd, recv_buf, mss, 0, (SA *)&from, &fromlen);
-        if (n <= 0) {
-            perror("recvfrom error");
-            exit(2);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                fprintf(stderr, "Cannot detect server\n");
+                exit(6);
+            } else {
+                perror("recvfrom error");
+                exit(2);
+            }
         }
 
         if ((size_t)n < header_size) {
@@ -119,7 +124,6 @@ void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packet
         received_count++;
     }
 
-    // Final check for packet loss
     for (int i = 0; i < expected_packets; i++) {
         if (!received[i]) {
             fprintf(stderr, "Packet loss detected (missing %d)\n", i);
@@ -130,7 +134,6 @@ void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packet
     free(recv_buf);
     free(received);
 }
-
 
 int main(int argc, char **argv) {
     int sockfd;
@@ -179,10 +182,23 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    // Send file chunks
-    int total_packets = dg_cli(in_file, sockfd, (SA *) &servaddr, sizeof(servaddr), mss);
+    // NEW: Set 60-second timeout
+    struct timeval timeout;
+    timeout.tv_sec = 60;
+    timeout.tv_usec = 0;
 
-    // Receive echoed packets and write them in order
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt failed");
+        fclose(in_file);
+        fclose(out_file);
+        close(sockfd);
+        exit(7);
+    }
+
+    // Send the file
+    int total_packets = dg_cli(in_file, sockfd, (SA *)&servaddr, sizeof(servaddr), mss);
+
+    // Receive echoed packets and write to output file
     recv_echoed_packets(out_file, sockfd, mss, total_packets);
 
     fclose(in_file);
