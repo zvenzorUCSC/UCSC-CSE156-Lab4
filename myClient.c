@@ -1,25 +1,26 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <string.h>         // for memset
-#include <unistd.h>         // for close(), read(), write(), usleep()
-#include <arpa/inet.h>      // for inet_pton()
-#include <sys/socket.h>     // for socket()
-#include <netinet/in.h>     // for sockaddr_in
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
-#define MAXLINE 4096        // Max buffer size
-#define TBD 17              // Intended error number
-#define SA struct sockaddr  // Stevens-style alias
-#define CRUZID_LEN 16       // pad the rest, just to make it more universaL
+#define MAXLINE 4096
+#define TBD 17
+#define SA struct sockaddr
+#define CRUZID_LEN 16
 
-const char *CRUZID = "zvenzor"; 
+const char *CRUZID = "zvenzor";
 
 struct packet_header {
     int32_t seq_num;
     char cruzid[CRUZID_LEN];
 };
 
-void dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int mss)
+// Step 1–2: Send file with headers
+int dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int mss)
 {
     if (mss <= sizeof(struct packet_header)) {
         fprintf(stderr, "Error: MSS too small for header\n");
@@ -39,15 +40,13 @@ void dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, in
     size_t bytes_read;
     while ((bytes_read = fread(data_ptr, 1, data_len, infile)) > 0) {
         struct packet_header header;
-        header.seq_num = htonl(seq);  // network byte order
+        header.seq_num = htonl(seq);
         memset(header.cruzid, 0, CRUZID_LEN);
         strncpy(header.cruzid, CRUZID, CRUZID_LEN - 1);
 
-        // Copy header into start of buf
         memcpy(buf, &header, sizeof(header));
 
-        ssize_t sent = sendto(sockfd, buf, bytes_read + sizeof(header), 0,
-                              pservaddr, servlen);
+        ssize_t sent = sendto(sockfd, buf, bytes_read + sizeof(header), 0, pservaddr, servlen);
         if (sent != bytes_read + sizeof(header)) {
             fprintf(stderr, "Packet %d send error or partial send\n", seq);
         } else {
@@ -55,59 +54,139 @@ void dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, in
         }
 
         seq++;
-        usleep(500000); // 0.5 sec delay to reduce UDP loss
+        usleep(500000);
     }
 
     free(buf);
+    return seq; // return how many packets were sent
 }
 
+// Step 3: Receive echoed packets and write to output file
+void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packets)
+{
+    char *recv_buf = malloc(mss);
+    if (!recv_buf) {
+        perror("malloc failed");
+        exit(TBD);
+    }
+
+    int *received = calloc(expected_packets, sizeof(int));
+    if (!received) {
+        perror("calloc failed");
+        free(recv_buf);
+        exit(TBD);
+    }
+
+    struct sockaddr_in from;
+    socklen_t fromlen = sizeof(from);
+    size_t header_size = sizeof(struct packet_header);
+    size_t data_size = mss - header_size;
+    int received_count = 0;
+
+    while (received_count < expected_packets) {
+        ssize_t n = recvfrom(sockfd, recv_buf, mss, 0, (SA *)&from, &fromlen);
+        if (n <= 0) {
+            perror("recvfrom error");
+            exit(2);
+        }
+
+        if ((size_t)n < header_size) {
+            fprintf(stderr, "Invalid packet (too small)\n");
+            exit(2);
+        }
+
+        struct packet_header *hdr = (struct packet_header *)recv_buf;
+        int seq_num = ntohl(hdr->seq_num);
+
+        if (seq_num < 0 || seq_num >= expected_packets) {
+            fprintf(stderr, "Invalid sequence number: %d\n", seq_num);
+            exit(2);
+        }
+
+        if (received[seq_num]) {
+            fprintf(stderr, "Duplicate packet %d\n", seq_num);
+            exit(2);
+        }
+
+        size_t payload_size = n - header_size;
+        size_t offset = seq_num * data_size;
+
+        fseek(outfile, offset, SEEK_SET);
+        fwrite(recv_buf + header_size, 1, payload_size, outfile);
+
+        printf("Wrote packet %d (%zu bytes at offset %zu)\n", seq_num, payload_size, offset);
+        received[seq_num] = 1;
+        received_count++;
+    }
+
+    // Final check for packet loss
+    for (int i = 0; i < expected_packets; i++) {
+        if (!received[i]) {
+            fprintf(stderr, "Packet loss detected (missing %d)\n", i);
+            exit(2);
+        }
+    }
+
+    free(recv_buf);
+    free(received);
+}
 
 
 int main(int argc, char **argv) {
     int sockfd;
     struct sockaddr_in servaddr;
 
-    // ./myclient <server_ip> <server_port> <mss> <in_file_path> <out_file_path>
-    if(argc != 6){
+    if (argc != 6) {
         fprintf(stderr, "usage: %s <server_ip> <server_port> <mss> <in_file_path> <out_file_path>\n", argv[0]);
         exit(TBD);
     }
 
-    // Parse command line arguments
     char *server_ip = argv[1];
     int server_port = atoi(argv[2]);
     int mss         = atoi(argv[3]);
     char *in_path   = argv[4];
-    char *out_path  = argv[5]; // unused for now — will use it in step 2
+    char *out_path  = argv[5];
 
-    // Open input file
     FILE *in_file = fopen(in_path, "rb");
     if (!in_file) {
         perror("input file open error");
         exit(TBD);
     }
 
-    // Set up UDP socket
+    FILE *out_file = fopen(out_path, "wb+");
+    if (!out_file) {
+        perror("output file open error");
+        fclose(in_file);
+        exit(3);
+    }
+
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket error");
+        fclose(in_file);
+        fclose(out_file);
         exit(EXIT_FAILURE);
     }
 
-    // Set server address
     bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(server_port);
 
     if (inet_pton(AF_INET, server_ip, &servaddr.sin_addr) <= 0) {
         perror("inet_pton error");
+        fclose(in_file);
+        fclose(out_file);
+        close(sockfd);
         exit(EXIT_FAILURE);
     }
 
-    // Send file in MSS-sized chunks
-    dg_cli(in_file, sockfd, (SA *) &servaddr, sizeof(servaddr), mss);
+    // Send file chunks
+    int total_packets = dg_cli(in_file, sockfd, (SA *) &servaddr, sizeof(servaddr), mss);
 
-    // Cleanup
+    // Receive echoed packets and write them in order
+    recv_echoed_packets(out_file, sockfd, mss, total_packets);
+
     fclose(in_file);
+    fclose(out_file);
     close(sockfd);
     exit(0);
 }
