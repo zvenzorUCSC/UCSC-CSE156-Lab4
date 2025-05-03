@@ -93,7 +93,8 @@ void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int 
     }
 }
 
-void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packets)
+void recv_echoed_packets(FILE *infile, FILE *outfile, int sockfd, int mss,
+                         int expected_packets, const char *out_path)
 {
     char *recv_buf = malloc(mss);
     if (!recv_buf) {
@@ -123,15 +124,21 @@ void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packet
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 fprintf(stderr, "Cannot detect server\n");
+                fclose(outfile);
+                remove(out_path);
                 exit(6);
             } else {
                 perror("recvfrom error");
+                fclose(outfile);
+                remove(out_path);
                 exit(2);
             }
         }
 
         if ((size_t)n < header_size) {
             fprintf(stderr, "Invalid packet (too small)\n");
+            fclose(outfile);
+            remove(out_path);
             exit(2);
         }
 
@@ -168,6 +175,22 @@ void recv_echoed_packets(FILE *outfile, int sockfd, int mss, int expected_packet
                 free(payload);
             }
         }
+    }
+
+    // Final packet loss check
+    int missing = 0;
+    for (int i = 0; i < expected_packets; i++) {
+        if (!received[i]) {
+            missing = 1;
+            break;
+        }
+    }
+
+    if (missing) {
+        fprintf(stderr, "Packet loss detected — output file will be deleted\n");
+        fclose(outfile);
+        remove(out_path);
+        exit(2);
     }
 
     free(recv_buf);
@@ -265,7 +288,8 @@ int main(int argc, char **argv) {
     }
 
     int total_packets = dg_cli(in_file, sockfd, (SA *)&servaddr, sizeof(servaddr), mss);
-    recv_echoed_packets(out_file, sockfd, mss, total_packets);
+    recv_echoed_packets(in_file, out_file, sockfd, mss, total_packets, out_path);
+
 
     fclose(in_file);
     fclose(out_file);
