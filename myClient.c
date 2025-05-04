@@ -11,7 +11,6 @@
 #include <libgen.h>     // dirname()
 #include <sys/stat.h>   // mkdir()
 #include <sys/types.h>
-#include <errno.h>
 
 
 #define MAXLINE 4096
@@ -19,6 +18,7 @@
 #define SA struct sockaddr
 #define CRUZID_LEN 16
 #define REORDER_BUFFER_SIZE 5
+#define MAX_MSS 1400
 
 const char *CRUZID = "zvenzor";
 
@@ -35,10 +35,7 @@ struct buffered_packet {
 
 int dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int mss)
 {
-    if (mss <= sizeof(struct packet_header)) {
-        fprintf(stderr, "Error: MSS too small for header\n");
-        exit(4);
-    }
+    
 
     char *buf = malloc(mss);
     if (!buf) {
@@ -62,7 +59,7 @@ int dg_cli(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int
         if (sent != bytes_read + sizeof(header)) {
             fprintf(stderr, "Packet %d send error or partial send\n", seq);
         } else {
-            printf("Sent packet %d (%zu bytes data + %zu header)\n", seq, bytes_read, sizeof(header));
+            // printf("Sent packet %d (%zu bytes data + %zu header)\n", seq, bytes_read, sizeof(header));
         }
 
         seq++;
@@ -79,7 +76,7 @@ void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int 
         if (buf[i].seq_num == *expected_seq) {
             fseek(outfile, (*expected_seq) * chunk_size, SEEK_SET);
             fwrite(buf[i].data, 1, buf[i].payload_size, outfile);
-            printf("Wrote buffered packet %d\n", buf[i].seq_num);
+            // printf("Wrote buffered packet %d\n", buf[i].seq_num);
             free(buf[i].data);
 
             for (int j = i; j < *count - 1; j++) {
@@ -159,7 +156,7 @@ void recv_echoed_packets(FILE *infile, FILE *outfile, int sockfd, int mss,
         if (seq_num == expected_seq) {
             fseek(outfile, seq_num * data_size, SEEK_SET);
             fwrite(payload, 1, payload_size, outfile);
-            printf("Wrote in-order packet %d\n", seq_num);
+            // printf("Wrote in-order packet %d\n", seq_num);
             free(payload);
             expected_seq++;
             flush_buffered(outfile, reorder_buf, &reorder_count, &expected_seq, data_size);
@@ -169,7 +166,7 @@ void recv_echoed_packets(FILE *infile, FILE *outfile, int sockfd, int mss,
                 reorder_buf[reorder_count].payload_size = payload_size;
                 reorder_buf[reorder_count].data = payload;
                 reorder_count++;
-                printf("Buffered out-of-order packet %d\n", seq_num);
+                // printf("Buffered out-of-order packet %d\n", seq_num);
             } else {
                 fprintf(stderr, "Reorder buffer full — dropping packet %d\n", seq_num);
                 free(payload);
@@ -198,28 +195,55 @@ void recv_echoed_packets(FILE *infile, FILE *outfile, int sockfd, int mss,
 }
 
 int create_parent_dirs(const char *filepath) {
-    char path_copy[4096];
-    strncpy(path_copy, filepath, sizeof(path_copy));
-    path_copy[sizeof(path_copy) - 1] = '\0';
+    char path[4096];
 
-    char *dir = dirname(path_copy);
-    if (!dir || strcmp(dir, ".") == 0) return 0;  // No directories to make
+    // Make a copy so we can safely modify it
+    strncpy(path, filepath, sizeof(path));
+    path[sizeof(path) - 1] = '\0';
 
-    char temp[4096] = {0};
-    char *token;
-    char *rest = dir;
+    // Remove trailing slash (if any)
+    size_t len = strlen(path);
+    if (len > 0 && path[len - 1] == '/') {
+        path[len - 1] = '\0';
+    }
 
-    while ((token = strtok_r(rest, "/", &rest))) {
-        strcat(temp, "/");
-        strcat(temp, token);
+    // Find the last slash to isolate directory path
+    char *slash = strrchr(path, '/');
+    if (!slash) {
+        // No directory part, nothing to create
+        return 0;
+    }
 
-        if (access(temp, F_OK) != 0) {
-            if (mkdir(temp, 0755) != 0 && errno != EEXIST) {
+    *slash = '\0';  // Truncate to just the directory path
+
+    // Now build each part of the path
+    char current[4096] = {0};
+
+    // Handle absolute vs relative path
+    if (path[0] == '/') {
+        strcpy(current, "/");
+    }
+
+    char *token = strtok(path, "/");
+    while (token) {
+        if (strlen(current) + strlen(token) + 2 >= sizeof(current)) {
+            fprintf(stderr, "Path too long\n");
+            return -1;
+        }
+
+        if (strlen(current) > 1) strcat(current, "/");
+        strcat(current, token);
+
+        if (access(current, F_OK) != 0) {
+            if (mkdir(current, 0755) != 0 && errno != EEXIST) {
                 perror("mkdir failed");
                 return -1;
             }
         }
+
+        token = strtok(NULL, "/");
     }
+
     return 0;
 }
 
@@ -238,6 +262,16 @@ int main(int argc, char **argv) {
     char *in_path   = argv[4];
     char *out_path  = argv[5];
 
+    if (mss <= sizeof(struct packet_header)) {
+        fprintf(stderr, "Error: MSS too small for header\n");
+        exit(4);
+    }
+
+    if (mss > MAX_MSS) {
+        fprintf(stderr, "Error: MSS too large for header. Keep it less than %d\n", MAX_MSS);
+        exit(4);
+    }
+
     FILE *in_file = fopen(in_path, "rb");
     if (!in_file) {
         perror("input file open error");
@@ -251,6 +285,7 @@ int main(int argc, char **argv) {
     }
 
     FILE *out_file = fopen(out_path, "wb+");
+    // printf(out_path);
     if (!out_file) {
         perror("output file open error");
         fclose(in_file);
@@ -290,9 +325,36 @@ int main(int argc, char **argv) {
     int total_packets = dg_cli(in_file, sockfd, (SA *)&servaddr, sizeof(servaddr), mss);
     recv_echoed_packets(in_file, out_file, sockfd, mss, total_packets, out_path);
 
+    // Rewind both files to compare
+    rewind(in_file);
+    rewind(out_file);
+
+    int mismatch = 0;
+    int ch1, ch2;
+
+    while (1) {
+        ch1 = fgetc(in_file);
+        ch2 = fgetc(out_file);
+
+        if (ch1 == EOF && ch2 == EOF) break; // both reached EOF → OK
+        if (ch1 != ch2) {
+            mismatch = 1;
+            break;
+        }
+    }
+
+
+    if (mismatch) {
+        fprintf(stderr, "File mismatch detected — deleting %s\n", out_path);
+        fclose(out_file);
+        // remove(out_path);
+    } else {
+        // printf("✅ Output file verified: identical to input.\n");
+        fclose(out_file);
+    }
 
     fclose(in_file);
-    fclose(out_file);
     close(sockfd);
-    exit(0);
+    exit(mismatch ? 8 : 0);
+
 }
