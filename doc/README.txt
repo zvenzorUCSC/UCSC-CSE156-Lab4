@@ -8,15 +8,13 @@ This project implements a UDP-based file echo application consisting of a client
 The client reads an input file, splits it into packets with a custom header, and sends them to the server over UDP. The server echoes the packets back to the client, which reconstructs the output file in the correct order. If the output file does not match the input file after reconstruction, it is deleted automatically.
 
 
-How to Build
-------------
+How to Build:
 Use the provided Makefile to build both the client and the server:
 
 
 This places `myClient` and `myServer` into the `bin/` directory.
 
-How to Run
-----------
+How to Run:
 Start the server (optionally specifying a port):
 
 ./myServer [port]
@@ -58,7 +56,6 @@ Internal Design:
 - Reconstructed file is validated against the input via byte comparison
 - If validation fails, the output is deleted
 
-Limitations
------------
+Limitations:
 - Reorder buffer is fixed to 5 packets; excessive out-of-order delivery may drop packets.
 - No retransmission logic (assumes server echoes reliably).
