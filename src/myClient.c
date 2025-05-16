@@ -1,3 +1,5 @@
+// myClient.c with Go-Back-N sliding window implementation (with final packet fix and debug message)
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,125 +12,59 @@
 #include <errno.h>
 
 #define CRUZID_LEN 16
-#define MAXLINE 4096
 #define MAX_MSS 1400
+#define MAX_PACKETS 32768
+#define TIMEOUT_SEC 2
 #define SA struct sockaddr
-
-const char *CRUZID = "zvenzor";
 
 struct packet_header {
     int32_t seq_num;
-    uint8_t type;      // 0 = INIT, 1 = DATA, 2 = ACK
+    uint8_t type;
     uint8_t is_last;
     char cruzid[CRUZID_LEN];
 };
 
-void send_init_packet(int sockfd, const struct sockaddr *pservaddr, socklen_t servlen, const char *out_path) {
-    struct packet_header hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.type = 0;  // INIT
-    strncpy(hdr.cruzid, CRUZID, CRUZID_LEN - 1);
+struct sent_packet {
+    int seq_num;
+    size_t size;
+    char *data;
+    int retransmit_count;
+    struct timeval sent_time;
+};
+
+void send_init_packet(int sockfd, const SA *pservaddr, socklen_t servlen, const char *path) {
+    struct packet_header hdr = {0};
+    hdr.type = 0;
+    strncpy(hdr.cruzid, "zvenzor", CRUZID_LEN - 1);
 
     size_t header_size = sizeof(hdr);
-    size_t path_len = strlen(out_path) + 1;
+    size_t path_len = strlen(path) + 1;
     size_t total_len = header_size + path_len;
 
     char *buf = malloc(total_len);
-    if (!buf) {
-        perror("malloc failed for INIT");
-        exit(10);
-    }
-
     memcpy(buf, &hdr, header_size);
-    memcpy(buf + header_size, out_path, path_len);
+    memcpy(buf + header_size, path, path_len);
 
-    if (sendto(sockfd, buf, total_len, 0, pservaddr, servlen) != total_len) {
-        perror("sendto INIT failed");
-        free(buf);
-        exit(11);
-    }
-
+    sendto(sockfd, buf, total_len, 0, pservaddr, servlen);
     free(buf);
 }
 
-int send_data_packets(FILE *infile, int sockfd, const SA *pservaddr, socklen_t servlen, int mss, int *total_packets_out) {
-    size_t header_size = sizeof(struct packet_header);
-    size_t data_len = mss - header_size;
-    char *buf = malloc(mss);
-    if (!buf) {
-        perror("malloc failed");
-        exit(12);
-    }
-
-    int seq = 0;
-    size_t bytes_read;
-
-    while ((bytes_read = fread(buf + header_size, 1, data_len, infile)) > 0) {
-        struct packet_header hdr;
-        hdr.seq_num = htonl(seq);
-        hdr.type = 1;
-        hdr.is_last = 0;
-        memset(hdr.cruzid, 0, CRUZID_LEN);
-        strncpy(hdr.cruzid, CRUZID, CRUZID_LEN - 1);
-
-        if (feof(infile)) hdr.is_last = 1;
-
-        memcpy(buf, &hdr, header_size);
-
-        if (sendto(sockfd, buf, bytes_read + header_size, 0, pservaddr, servlen) < 0) {
-            perror("sendto failed");
-            free(buf);
-            exit(13);
-        }
-
-        printf("Sent packet %d (%zu bytes)\n", seq, bytes_read);
-        seq++;
-        usleep(100000);
-    }
-
-    *total_packets_out = seq;
-    free(buf);
-    return 0;
-}
-
-void recv_acks(int sockfd, int total_packets) {
-    int *acked = calloc(total_packets, sizeof(int));
-    if (!acked) exit(14);
-
-    int acked_count = 0;
-    char buf[128];
-    struct sockaddr_in from;
-    socklen_t fromlen = sizeof(from);
-
-    while (acked_count < total_packets) {
-        ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromlen);
-        if (n < sizeof(struct packet_header)) continue;
-
-        struct packet_header *hdr = (struct packet_header *)buf;
-        if (hdr->type != 2) continue;
-
-        int seq = ntohl(hdr->seq_num);
-        if (seq < 0 || seq >= total_packets || acked[seq]) continue;
-
-        acked[seq] = 1;
-        acked_count++;
-        printf("Received ACK for packet %d\n", seq);
-    }
-
-    free(acked);
+int timeval_diff_ms(struct timeval *start, struct timeval *end) {
+    return (end->tv_sec - start->tv_sec) * 1000 + (end->tv_usec - start->tv_usec) / 1000;
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr, "usage: %s <server_ip> <port> <mss> <in_file> <out_path>\n", argv[0]);
+    if (argc != 7) {
+        fprintf(stderr, "usage: %s <server_ip> <server_port> <mss> <winsz> <in_file> <out_path>\n", argv[0]);
         exit(1);
     }
 
     char *server_ip = argv[1];
-    int port = atoi(argv[2]);
+    int server_port = atoi(argv[2]);
     int mss = atoi(argv[3]);
-    char *in_path = argv[4];
-    char *out_path = argv[5];
+    int winsz = atoi(argv[4]);
+    char *in_path = argv[5];
+    char *out_path = argv[6];
 
     if (mss < sizeof(struct packet_header)) {
         fprintf(stderr, "Required minimum MSS is %lu\n", sizeof(struct packet_header));
@@ -136,32 +72,88 @@ int main(int argc, char **argv) {
     }
 
     FILE *infile = fopen(in_path, "rb");
-    if (!infile) {
-        perror("input file error");
-        exit(2);
-    }
+    if (!infile) { perror("fopen input"); exit(2); }
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        perror("socket error");
-        exit(3);
-    }
-
     struct sockaddr_in servaddr;
+    socklen_t servlen = sizeof(servaddr);
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(port);
+    servaddr.sin_port = htons(server_port);
     inet_pton(AF_INET, server_ip, &servaddr.sin_addr);
 
-    struct timeval timeout = {.tv_sec = 30, .tv_usec = 0};
+    struct timeval timeout = {.tv_sec = TIMEOUT_SEC, .tv_usec = 0};
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    send_init_packet(sockfd, (SA *)&servaddr, sizeof(servaddr), out_path);
+    send_init_packet(sockfd, (SA *)&servaddr, servlen, out_path);
 
-    int total_packets = 0;
-    send_data_packets(infile, sockfd, (SA *)&servaddr, sizeof(servaddr), mss, &total_packets);
-    recv_acks(sockfd, total_packets);
+    struct sent_packet window[MAX_PACKETS] = {0};
+    int base_sn = 0, next_sn = 0, total_packets = 0;
+    size_t payload_size = mss - sizeof(struct packet_header);
 
+    // Read entire file into packet buffer (fix: only create packets with data)
+    while (1) {
+        char *buf = malloc(mss);
+        size_t read = fread(buf + sizeof(struct packet_header), 1, payload_size, infile);
+        if (read == 0) {
+            free(buf);
+            break;
+        }
+
+        struct packet_header *hdr = (struct packet_header *)buf;
+        hdr->seq_num = htonl(total_packets);
+        hdr->type = 1;
+        hdr->is_last = feof(infile);
+        strncpy(hdr->cruzid, "zvenzor", CRUZID_LEN - 1);
+
+        if (hdr->is_last) {
+            printf("Sending final packet: %d\n", total_packets);
+        }
+
+        window[total_packets].seq_num = total_packets;
+        window[total_packets].size = read + sizeof(struct packet_header);
+        window[total_packets].data = buf;
+        window[total_packets].retransmit_count = 0;
+
+        total_packets++;
+    }
+
+    while (base_sn < total_packets) {
+        // Send packets within window
+        while (next_sn < base_sn + winsz && next_sn < total_packets) {
+            sendto(sockfd, window[next_sn].data, window[next_sn].size, 0, (SA *)&servaddr, servlen);
+            gettimeofday(&window[next_sn].sent_time, NULL);
+            printf("Sent DATA, %d\n", next_sn);
+            next_sn++;
+        }
+
+        // Receive ACKs
+        struct packet_header ack;
+        ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, NULL, NULL);
+        if (n >= sizeof(struct packet_header) && ack.type == 2) {
+            int ack_sn = ntohl(ack.seq_num);
+            if (ack_sn >= base_sn) {
+                base_sn = ack_sn + 1;
+            }
+        }
+
+        // Timeout check
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        if (base_sn < next_sn) {
+            int elapsed = timeval_diff_ms(&window[base_sn].sent_time, &now);
+            if (elapsed > TIMEOUT_SEC * 1000) {
+                printf("Timeout — resending window\n");
+                for (int i = base_sn; i < next_sn; i++) {
+                    sendto(sockfd, window[i].data, window[i].size, 0, (SA *)&servaddr, servlen);
+                    gettimeofday(&window[i].sent_time, NULL);
+                    printf("Resent DATA, %d\n", i);
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < total_packets; i++) free(window[i].data);
     fclose(infile);
     close(sockfd);
     return 0;
