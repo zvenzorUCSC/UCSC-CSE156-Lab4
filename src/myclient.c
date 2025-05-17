@@ -8,7 +8,6 @@
 #include <netinet/in.h>
 #include <sys/time.h>
 #include <errno.h>
-#include <time.h>
 
 #define CRUZID_LEN 16
 #define MAX_MSS 1400
@@ -95,7 +94,6 @@ int main(int argc, char **argv) {
 
     int base_sn = 0, next_sn = 0, eof_reached = 0;
     size_t payload_size = mss - sizeof(struct packet_header);
-    time_t last_recv_time = time(NULL);  // ✅ initialize server activity clock
 
     while (!eof_reached || base_sn < next_sn) {
         // Fill window
@@ -137,7 +135,6 @@ int main(int argc, char **argv) {
         struct packet_header ack = {0};
         ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, NULL, NULL);
         if (n >= sizeof(struct packet_header) && ack.type == 2) {
-            last_recv_time = time(NULL);  // ✅ reset on valid ACK
             int ack_sn = ntohl(ack.seq_num);
             if (ack_sn >= base_sn) {
                 for (int i = base_sn; i <= ack_sn && i < next_sn; i++) {
@@ -148,7 +145,6 @@ int main(int argc, char **argv) {
                 printf("ACK %d BASE %d NEXT %d WINDOW [%d,%d)\n", ack_sn, base_sn, next_sn, base_sn, base_sn + winsz);
             }
         }
-
         // Timeout check
         struct timeval now;
         gettimeofday(&now, NULL);
@@ -177,12 +173,8 @@ int main(int argc, char **argv) {
                 }
             }
         }
-
-        if (difftime(time(NULL), last_recv_time) > 30) {
-            fprintf(stderr, "Server is down\n");
-            exit(5);
-        }
     }
+
 
     free(window);
     fclose(infile);

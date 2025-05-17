@@ -1,13 +1,13 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
 
-all: myServer myClient
+all: bin/myserver bin/myclient
 
-myServer: myServer.c
-	$(CC) $(CFLAGS) -o myServer myServer.c
+bin/myserver: src/myserver.c
+	gcc -Wall -Wextra -O2 -o bin/myserver src/myserver.c
 
-myClient: myClient.c
-	$(CC) $(CFLAGS) -o myClient myClient.c
+bin/myclient: src/myclient.c
+	gcc -Wall -Wextra -O2 -o bin/myclient src/myclient.c
 
 clean:
-	rm -f myServer myClient
+	rm -f bin/myserver bin/myclient
