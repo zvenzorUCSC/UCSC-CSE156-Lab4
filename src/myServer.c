@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <time.h>
 
 #define MAXLINE 32768
 #define CRUZID_LEN 16
@@ -16,7 +17,7 @@
 
 struct packet_header {
     int32_t seq_num;
-    uint8_t type;      // 0 = INIT, 1 = DATA, 2 = ACK
+    uint8_t type;
     uint8_t is_last;
     char cruzid[CRUZID_LEN];
 };
@@ -58,10 +59,7 @@ void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int 
             fseek(outfile, (*expected_seq) * chunk_size, SEEK_SET);
             fwrite(buf[i].data, 1, buf[i].payload_size, outfile);
             free(buf[i].data);
-
-            for (int j = i; j < *count - 1; j++) {
-                buf[j] = buf[j + 1];
-            }
+            for (int j = i; j < *count - 1; j++) buf[j] = buf[j + 1];
             (*count)--;
             (*expected_seq)++;
         } else {
@@ -70,11 +68,21 @@ void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int 
     }
 }
 
+void print_drop_log(const char *type, int seq_num) {
+    time_t now = time(NULL);
+    struct tm *utc = gmtime(&now);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", utc);
+    printf("%s, DROP %s, %d\n", timestamp, type, seq_num);
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s <port> <droppc>\n", argv[0]);
         exit(1);
     }
+
+    srand(time(NULL));  // seed random for drop simulation
 
     int port = atoi(argv[1]);
     int droppc = atoi(argv[2]);
@@ -110,7 +118,7 @@ int main(int argc, char **argv) {
 
         struct packet_header *hdr = (struct packet_header *)buf;
 
-        if (hdr->type == 0) {  // INIT
+        if (hdr->type == 0) {
             const char *path = (char *)(buf + sizeof(struct packet_header));
             size_t path_len = strlen(path) + 1;
 
@@ -142,9 +150,16 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        if (hdr->type != 1 || outfile == NULL) continue;  // Ignore non-DATA or if no INIT yet
+        if (hdr->type != 1 || outfile == NULL) continue;
 
         int seq_num = ntohl(hdr->seq_num);
+
+        // Simulate drop of incoming DATA packet
+        if ((rand() % 100) < droppc) {
+            print_drop_log("DATA", seq_num);
+            continue;
+        }
+
         size_t payload_size = n - sizeof(struct packet_header);
         char *payload = malloc(payload_size);
         memcpy(payload, buf + sizeof(struct packet_header), payload_size);
@@ -169,16 +184,28 @@ int main(int argc, char **argv) {
 
         if (hdr->is_last) {
             printf("Last packet received (flagged by client).\n");
+            fflush(outfile);
+            int fd = fileno(outfile);
+            long final_size = (seq_num * chunk_size) + payload_size;
+            if (ftruncate(fd, final_size) != 0) {
+                perror("ftruncate failed");
+            } else {
+                printf("File truncated to final size: %ld bytes\n", final_size);
+            }
         }
 
-        // Send cumulative ACK
         struct packet_header ack = {0};
         ack.seq_num = htonl(expected_seq - 1);
         ack.type = 2;
         strncpy(ack.cruzid, hdr->cruzid, CRUZID_LEN);
-
-        sendto(sockfd, &ack, sizeof(ack), 0, (SA *)&cliaddr, len);
-        printf("ACK sent for seq %d (cumulative)\n", expected_seq - 1);
+        
+        // Simulate drop of outgoing ACK packet
+        if ((rand() % 100) < droppc) {
+            print_drop_log("ACK", expected_seq - 1);
+        } else {
+            sendto(sockfd, &ack, sizeof(ack), 0, (SA *)&cliaddr, len);
+            printf("ACK sent for seq %d (cumulative)\n", expected_seq - 1);
+        }
     }
 
     if (outfile) fclose(outfile);

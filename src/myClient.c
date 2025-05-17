@@ -94,7 +94,6 @@ int main(int argc, char **argv) {
 
     send_init_packet(sockfd, (SA *)&servaddr, servlen, out_path, mss - sizeof(struct packet_header));
 
-
     struct sent_packet *window = calloc(winsz, sizeof(struct sent_packet));
     if (!window) { perror("calloc window"); exit(3); }
 
