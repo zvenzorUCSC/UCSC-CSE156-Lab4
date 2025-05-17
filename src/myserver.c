@@ -6,15 +6,14 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <sys/time.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
 
+#define MAXLINE 32768
 #define CRUZID_LEN 16
-#define MAX_MSS 1400
-#define TIMEOUT_SEC 2
+#define REORDER_BUFFER_SIZE 5
 #define SA struct sockaddr
-#define MAX_RETRIES 5
 
 struct packet_header {
     int32_t seq_num;
@@ -23,16 +22,53 @@ struct packet_header {
     char cruzid[CRUZID_LEN];
 };
 
-struct sent_packet {
+struct buffered_packet {
     int seq_num;
-    size_t size;
+    size_t payload_size;
     char *data;
-    int retransmit_count;
-    struct timeval sent_time;
 };
 
-// CSV logging helper with RFC 3339 timestamp
-void print_csv_log(const char *type, int seq, int base_sn, int next_sn, int winsz) {
+int create_parent_dirs(const char *filepath) {
+    char path[4096];
+    strncpy(path, filepath, sizeof(path));
+    path[sizeof(path) - 1] = '\0';
+
+    char *slash = strrchr(path, '/');
+    if (!slash) return 0;
+    *slash = '\0';
+
+    char current[4096] = {0};
+    if (path[0] == '/') strcpy(current, "/");
+
+    char *token = strtok(path, "/");
+    while (token) {
+        if (strlen(current) + strlen(token) + 2 >= sizeof(current)) return -1;
+        if (strlen(current) > 1) strcat(current, "/");
+        strcat(current, token);
+        if (access(current, F_OK) != 0) {
+            if (mkdir(current, 0755) != 0 && errno != EEXIST) return -1;
+        }
+        token = strtok(NULL, "/");
+    }
+    return 0;
+}
+
+void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int *expected_seq, int chunk_size) {
+    for (int i = 0; i < *count;) {
+        if (buf[i].seq_num == *expected_seq) {
+            fseek(outfile, (*expected_seq) * chunk_size, SEEK_SET);
+            fwrite(buf[i].data, 1, buf[i].payload_size, outfile);
+            free(buf[i].data);
+            for (int j = i; j < *count - 1; j++) buf[j] = buf[j + 1];
+            (*count)--;
+            (*expected_seq)++;
+        } else {
+            i++;
+        }
+    }
+}
+
+void print_drop_log(const char *type, int seq_num) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
 
@@ -41,164 +77,142 @@ void print_csv_log(const char *type, int seq, int base_sn, int next_sn, int wins
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", tm_utc);
     int millis = tv.tv_usec / 1000;
 
-    printf("%s.%03dZ, %s, %d, %d, %d, %d\n",
-           timestamp, millis, type, seq, base_sn, next_sn, base_sn + winsz);
-}
-
-void send_init_packet(int sockfd, const SA *pservaddr, socklen_t servlen, const char *path, int chunk_size) {
-    struct packet_header hdr = {0};
-    hdr.type = 0;
-    strncpy(hdr.cruzid, "zvenzor", CRUZID_LEN - 1);
-
-    int32_t net_chunk_size = htonl(chunk_size);
-    size_t header_size = sizeof(hdr);
-    size_t path_len = strlen(path) + 1;
-    size_t total_len = header_size + path_len + sizeof(int32_t);
-
-    char *buf = malloc(total_len);
-    if (!buf) { perror("malloc failed"); exit(1); }
-
-    memcpy(buf, &hdr, header_size);
-    memcpy(buf + header_size, path, path_len);
-    memcpy(buf + header_size + path_len, &net_chunk_size, sizeof(int32_t));
-
-    sendto(sockfd, buf, total_len, 0, pservaddr, servlen);
-    free(buf);
-}
-
-int timeval_diff_ms(struct timeval *start, struct timeval *end) {
-    return (end->tv_sec - start->tv_sec) * 1000 + (end->tv_usec - start->tv_usec) / 1000;
+    printf("%s.%03dZ, DROP %s, %d\n", timestamp, millis, type, seq_num);
 }
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
-        fprintf(stderr, "usage: %s <server_ip> <server_port> <mss> <winsz> <in_file> <out_path>\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <port> <droppc>\n", argv[0]);
         exit(1);
     }
 
-    char *server_ip = argv[1];
-    int server_port = atoi(argv[2]);
-    int mss = atoi(argv[3]);
-    int winsz = atoi(argv[4]);
-    char *in_path = argv[5];
-    char *out_path = argv[6];
+    srand(time(NULL));  // seed random for drop simulation
 
-    if (mss < sizeof(struct packet_header)) {
-        fprintf(stderr, "Required minimum MSS is %lu\n", sizeof(struct packet_header));
-        exit(1);
-    }
-
-    FILE *infile = fopen(in_path, "rb");
-    if (!infile) { perror("fopen input"); exit(2); }
+    int port = atoi(argv[1]);
+    int droppc = atoi(argv[2]);
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in servaddr;
-    socklen_t servlen = sizeof(servaddr);
-    memset(&servaddr, 0, sizeof(servaddr));
+    if (sockfd < 0) {
+        perror("socket error");
+        exit(2);
+    }
+
+    struct sockaddr_in servaddr = {0}, cliaddr;
+    socklen_t len = sizeof(cliaddr);
+
     servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(server_port);
-    inet_pton(AF_INET, server_ip, &servaddr.sin_addr);
+    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servaddr.sin_port = htons(port);
 
-    struct timeval timeout = {.tv_sec = TIMEOUT_SEC, .tv_usec = 0};
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (bind(sockfd, (SA *)&servaddr, sizeof(servaddr)) < 0) {
+        perror("bind error");
+        exit(3);
+    }
 
-    send_init_packet(sockfd, (SA *)&servaddr, servlen, out_path, mss - sizeof(struct packet_header));
+    char buf[MAXLINE];
+    FILE *outfile = NULL;
+    int expected_seq = 0;
+    int chunk_size = 0;
+    struct buffered_packet reorder_buf[REORDER_BUFFER_SIZE];
+    int reorder_count = 0;
 
-    struct sent_packet *window = calloc(winsz, sizeof(struct sent_packet));
-    if (!window) { perror("calloc window"); exit(3); }
+    while (1) {
+        ssize_t n = recvfrom(sockfd, buf, MAXLINE, 0, (SA *)&cliaddr, &len);
+        if (n < sizeof(struct packet_header)) continue;
 
-    int base_sn = 0, next_sn = 0, eof_reached = 0;
-    size_t payload_size = mss - sizeof(struct packet_header);
-    time_t last_recv_time = time(NULL);
+        struct packet_header *hdr = (struct packet_header *)buf;
 
-    while (!eof_reached || base_sn < next_sn) {
-        while (next_sn < base_sn + winsz && !eof_reached) {
-            char *buf = malloc(mss);
-            size_t read = fread(buf + sizeof(struct packet_header), 1, payload_size, infile);
+        if (hdr->type == 0) {
+            const char *path = (char *)(buf + sizeof(struct packet_header));
+            size_t path_len = strlen(path) + 1;
 
-            if (read == 0 && feof(infile)) {
-                free(buf);
-                eof_reached = 1;
-                break;
+            if (n < sizeof(struct packet_header) + path_len + sizeof(int32_t)) {
+                fprintf(stderr, "INIT packet too short\n");
+                continue;
             }
 
-            int next_byte = fgetc(infile);
-            if (next_byte == EOF) {
-                ((struct packet_header *)buf)->is_last = 1;
-                fprintf(stdout, "Sending final packet: %d\n", next_sn);
-                eof_reached = 1;
+            int32_t net_chunk_size;
+            memcpy(&net_chunk_size, buf + sizeof(struct packet_header) + path_len, sizeof(int32_t));
+            chunk_size = ntohl(net_chunk_size);
+
+            printf("Received INIT. Saving to: %s\n", path);
+            printf("Chunk size: %d\n", chunk_size);
+
+            if (create_parent_dirs(path) < 0) {
+                fprintf(stderr, "Could not create directory\n");
+                exit(4);
+            }
+
+            outfile = fopen(path, "wb");
+            if (!outfile) {
+                perror("fopen failed");
+                exit(5);
+            }
+
+            expected_seq = 0;
+            reorder_count = 0;
+            continue;
+        }
+
+        if (hdr->type != 1 || outfile == NULL) continue;
+
+        int seq_num = ntohl(hdr->seq_num);
+
+        // Simulate drop of incoming DATA packet
+        if ((rand() % 100) < droppc) {
+            print_drop_log("DATA", seq_num);
+            continue;
+        }
+
+        size_t payload_size = n - sizeof(struct packet_header);
+        char *payload = malloc(payload_size);
+        memcpy(payload, buf + sizeof(struct packet_header), payload_size);
+
+        if (seq_num == expected_seq) {
+            fseek(outfile, seq_num * chunk_size, SEEK_SET);
+            fwrite(payload, 1, payload_size, outfile);
+            free(payload);
+            expected_seq++;
+            flush_buffered(outfile, reorder_buf, &reorder_count, &expected_seq, chunk_size);
+        } else {
+            if (reorder_count < REORDER_BUFFER_SIZE) {
+                reorder_buf[reorder_count].seq_num = seq_num;
+                reorder_buf[reorder_count].payload_size = payload_size;
+                reorder_buf[reorder_count].data = payload;
+                reorder_count++;
             } else {
-                ((struct packet_header *)buf)->is_last = 0;
-                ungetc(next_byte, infile);
+                fprintf(stderr, "Reorder buffer full — dropping packet %d\n", seq_num);
+                free(payload);
             }
+        }
 
-            struct packet_header *hdr = (struct packet_header *)buf;
-            hdr->seq_num = htonl(next_sn);
-            hdr->type = 1;
-            strncpy(hdr->cruzid, "zvenzor", CRUZID_LEN - 1);
-
-            int win_idx = next_sn % winsz;
-            window[win_idx].seq_num = next_sn;
-            window[win_idx].size = read + sizeof(struct packet_header);
-            window[win_idx].data = buf;
-            window[win_idx].retransmit_count = 0;
-            gettimeofday(&window[win_idx].sent_time, NULL);
-
-            sendto(sockfd, buf, window[win_idx].size, 0, (SA *)&servaddr, servlen);
-            print_csv_log("DATA", next_sn, base_sn, next_sn + 1, winsz);
-
-            next_sn++;
+        if (hdr->is_last) {
+            printf("Last packet received (flagged by client).\n");
+            fflush(outfile);
+            int fd = fileno(outfile);
+            long final_size = (seq_num * chunk_size) + payload_size;
+            if (ftruncate(fd, final_size) != 0) {
+                perror("ftruncate failed");
+            } else {
+                printf("File truncated to final size: %ld bytes\n", final_size);
+            }
         }
 
         struct packet_header ack = {0};
-        ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, NULL, NULL);
-        if (n >= sizeof(struct packet_header) && ack.type == 2) {
-            last_recv_time = time(NULL);
-            int ack_sn = ntohl(ack.seq_num);
-            if (ack_sn >= base_sn) {
-                for (int i = base_sn; i <= ack_sn && i < next_sn; i++) {
-                    int win_idx = i % winsz;
-                    free(window[win_idx].data);
-                }
-                base_sn = ack_sn + 1;
-                print_csv_log("ACK", ack_sn, base_sn, next_sn, winsz);
-            }
-        }
-
-        struct timeval now;
-        gettimeofday(&now, NULL);
-
-        if (base_sn < next_sn) {
-            int win_idx = base_sn % winsz;
-            int elapsed = timeval_diff_ms(&window[win_idx].sent_time, &now);
-
-            if (elapsed > TIMEOUT_SEC * 1000) {
-                for (int i = base_sn; i < next_sn; i++) {
-                    win_idx = i % winsz;
-
-                    window[win_idx].retransmit_count++;
-                    fprintf(stderr, "Packet loss detected\n");
-
-                    if (window[win_idx].retransmit_count > MAX_RETRIES) {
-                        fprintf(stderr, "Maximum retransmissions exceeded for packet %d\n", window[win_idx].seq_num);
-                        exit(4);
-                    }
-
-                    sendto(sockfd, window[win_idx].data, window[win_idx].size, 0, (SA *)&servaddr, servlen);
-                    gettimeofday(&window[win_idx].sent_time, NULL);
-                    print_csv_log("DATA", window[win_idx].seq_num, base_sn, next_sn, winsz);
-                }
-            }
-        }
-
-        if (difftime(time(NULL), last_recv_time) > 30) {
-            fprintf(stderr, "Server is down\n");
-            exit(5);
+        ack.seq_num = htonl(expected_seq - 1);
+        ack.type = 2;
+        strncpy(ack.cruzid, hdr->cruzid, CRUZID_LEN);
+        
+        // Simulate drop of outgoing ACK packet
+        if ((rand() % 100) < droppc) {
+            print_drop_log("ACK", expected_seq - 1);
+        } else {
+            sendto(sockfd, &ack, sizeof(ack), 0, (SA *)&cliaddr, len);
+            printf("ACK sent for seq %d (cumulative)\n", expected_seq - 1);
         }
     }
 
-    free(window);
-    fclose(infile);
+    if (outfile) fclose(outfile);
     close(sockfd);
     return 0;
 }
