@@ -52,7 +52,7 @@ int create_parent_dirs(const char *filepath) {
     return 0;
 }
 
-void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int *expected_seq, size_t chunk_size) {
+void flush_buffered(FILE *outfile, struct buffered_packet *buf, int *count, int *expected_seq, int chunk_size) {
     for (int i = 0; i < *count;) {
         if (buf[i].seq_num == *expected_seq) {
             fseek(outfile, (*expected_seq) * chunk_size, SEEK_SET);
@@ -100,6 +100,7 @@ int main(int argc, char **argv) {
     char buf[MAXLINE];
     FILE *outfile = NULL;
     int expected_seq = 0;
+    int chunk_size = 0;
     struct buffered_packet reorder_buf[REORDER_BUFFER_SIZE];
     int reorder_count = 0;
 
@@ -108,19 +109,34 @@ int main(int argc, char **argv) {
         if (n < sizeof(struct packet_header)) continue;
 
         struct packet_header *hdr = (struct packet_header *)buf;
+
         if (hdr->type == 0) {  // INIT
             const char *path = (char *)(buf + sizeof(struct packet_header));
+            size_t path_len = strlen(path) + 1;
+
+            if (n < sizeof(struct packet_header) + path_len + sizeof(int32_t)) {
+                fprintf(stderr, "INIT packet too short\n");
+                continue;
+            }
+
+            int32_t net_chunk_size;
+            memcpy(&net_chunk_size, buf + sizeof(struct packet_header) + path_len, sizeof(int32_t));
+            chunk_size = ntohl(net_chunk_size);
+
             printf("Received INIT. Saving to: %s\n", path);
+            printf("Chunk size: %d\n", chunk_size);
 
             if (create_parent_dirs(path) < 0) {
                 fprintf(stderr, "Could not create directory\n");
                 exit(4);
             }
+
             outfile = fopen(path, "wb");
             if (!outfile) {
                 perror("fopen failed");
                 exit(5);
             }
+
             expected_seq = 0;
             reorder_count = 0;
             continue;
@@ -134,11 +150,11 @@ int main(int argc, char **argv) {
         memcpy(payload, buf + sizeof(struct packet_header), payload_size);
 
         if (seq_num == expected_seq) {
-            fseek(outfile, seq_num * payload_size, SEEK_SET);
+            fseek(outfile, seq_num * chunk_size, SEEK_SET);
             fwrite(payload, 1, payload_size, outfile);
             free(payload);
             expected_seq++;
-            flush_buffered(outfile, reorder_buf, &reorder_count, &expected_seq, payload_size);
+            flush_buffered(outfile, reorder_buf, &reorder_count, &expected_seq, chunk_size);
         } else {
             if (reorder_count < REORDER_BUFFER_SIZE) {
                 reorder_buf[reorder_count].seq_num = seq_num;
@@ -151,14 +167,18 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Send ACK
+        if (hdr->is_last) {
+            printf("Last packet received (flagged by client).\n");
+        }
+
+        // Send cumulative ACK
         struct packet_header ack = {0};
-        ack.seq_num = htonl(seq_num);
-        ack.type = 2;  // ACK
+        ack.seq_num = htonl(expected_seq - 1);
+        ack.type = 2;
         strncpy(ack.cruzid, hdr->cruzid, CRUZID_LEN);
 
         sendto(sockfd, &ack, sizeof(ack), 0, (SA *)&cliaddr, len);
-        printf("ACK sent for packet %d\n", seq_num);
+        printf("ACK sent for seq %d (cumulative)\n", expected_seq - 1);
     }
 
     if (outfile) fclose(outfile);
