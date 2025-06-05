@@ -53,6 +53,20 @@ int timeval_diff_ms(struct timeval *start, struct timeval *end) {
     return (end->tv_sec - start->tv_sec) * 1000 + (end->tv_usec - start->tv_usec) / 1000;
 }
 
+void log_packet_event(const char *event, int lport, const char *rip, int rport,
+                      const char *type, int pktsn, int base, int next, int end) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm *tm = gmtime(&tv.tv_sec);
+    char timestamp[64];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S", tm);
+    int millis = tv.tv_usec / 1000;
+
+    printf("%s.%03dZ, %d, %s, %d, %s, %d, %d, %d, %d\n",
+           timestamp, millis, lport, rip, rport, type, pktsn, base, next, end);
+    fflush(stdout);
+}
+
 int load_servers(const char *filename, struct server_info *servers) {
     FILE *fp = fopen(filename, "r");
     if (!fp) {
@@ -113,6 +127,11 @@ void *replicate_to_server(void *arg) {
     inet_pton(AF_INET, args->sinfo.ip, &servaddr.sin_addr);
     socklen_t servlen = sizeof(servaddr);
 
+    struct sockaddr_in localaddr;
+    socklen_t addrlen = sizeof(localaddr);
+    getsockname(sockfd, (struct sockaddr *)&localaddr, &addrlen);
+    int lport = ntohs(localaddr.sin_port);
+
     struct timeval timeout = {.tv_sec = TIMEOUT_SEC, .tv_usec = 0};
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
@@ -148,6 +167,8 @@ void *replicate_to_server(void *arg) {
             gettimeofday(&window[win_idx].sent_time, NULL);
 
             sendto(sockfd, buf, window[win_idx].size, 0, (SA *)&servaddr, servlen);
+            log_packet_event("SEND", lport, args->sinfo.ip, args->sinfo.port, "DATA",
+                             next_sn, base_sn, next_sn + 1, base_sn + args->winsz);
             next_sn++;
         }
 
@@ -161,6 +182,8 @@ void *replicate_to_server(void *arg) {
                     free(window[win_idx].data);
                 }
                 base_sn = ack_sn + 1;
+                log_packet_event("RECV", lport, args->sinfo.ip, args->sinfo.port, "ACK",
+                                 ack_sn, base_sn, next_sn, base_sn + args->winsz);
             }
         }
 
@@ -185,6 +208,8 @@ void *replicate_to_server(void *arg) {
 
                     sendto(sockfd, window[win_idx].data, window[win_idx].size, 0, (SA *)&servaddr, servlen);
                     gettimeofday(&window[win_idx].sent_time, NULL);
+                    log_packet_event("RESEND", lport, args->sinfo.ip, args->sinfo.port, "DATA",
+                                     window[win_idx].seq_num, base_sn, next_sn, base_sn + args->winsz);
                 }
             }
         }
